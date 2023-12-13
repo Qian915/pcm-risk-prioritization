@@ -1,4 +1,4 @@
-# Predicting Unseen Process Behavior Based on Context Information from Compliance Constraints
+# Predictive Compliance Monitoring with Risk Prioritization in Process-Aware Information Systems
 
 ## Description
 Code accompanying the paper Predictive Compliance Monitoring with Risk Prioritization in Process-Aware Information Systems
