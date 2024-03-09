@@ -1,7 +1,7 @@
-# Predictive Compliance Monitoring with Risk Prioritization in Process-Aware Information Systems
+# Predictive Compliance Monitoring
 
 ## Description
-Code accompanying the paper Predictive Compliance Monitoring with Risk Prioritization in Process-Aware Information Systems
+Code accompanying the paper Quantifying The Degree Of Process Compliance: A Predictive Compliance Monitoring Approach
 
 ## Getting started
 
