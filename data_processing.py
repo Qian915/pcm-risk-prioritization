@@ -7,6 +7,7 @@ import pm4py
 import pandas as pd
 import numpy as np
 import datetime
+import time
 from dateutil.relativedelta import relativedelta
 
 parser = argparse.ArgumentParser(
@@ -14,12 +15,12 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument("--dataset", 
     type=str, 
-    default="BPIC_2011",
+    default="bpic2011_c1",
     help="dataset name")
 
 parser.add_argument("--file_format", 
     type=str, 
-    default="xes",
+    default="csv",
     help="format of event log")
 
 parser.add_argument("--granularity", 
@@ -37,13 +38,15 @@ def load_log(log_name, file_format):
     else:
         csv_file_path = f"data/{log_name}/{log_name}.csv"
         df = pd.read_csv(csv_file_path)
-        df = df.sample(frac=1, random_state=42)         ##### shuffle df #####
+        #df = df.sample(frac=1, random_state=42)         ##### shuffle df #####
 
     df = df[["case:concept:name", "concept:name","time:timestamp"]]
     # for BPIC 2011: delete empty spaces
     if log_name == "BPIC_2011":
         df['concept:name'] = df['concept:name'].apply(delte_empty_spaces)
+        
     df["concept:name"] = df["concept:name"].str.lower()
+    df.sort_values(by = ["time:timestamp"], inplace = True)	# sort df by timestamp
     df["time:timestamp"] = pd.to_datetime(df["time:timestamp"]).map(lambda x: x.strftime("%Y-%m-%d %H:%M:%S"))
 
     # add [eoc] to the end of each case
@@ -164,6 +167,9 @@ if __name__ == "__main__":
     test_list = df["case:concept:name"].unique()[train_test_ratio:]
     train_df = df[df["case:concept:name"].isin(train_list)]
     test_df = df[df["case:concept:name"].isin(test_list)]
+    start = time.time()
     process_df_train(train_df, dir_path, args.dataset, args.granularity)
     process_df_test(test_df, dir_path, args.dataset, args.granularity)
-    
+    end = time.time()
+    diff = end - start
+    print("########## Time spent for data processing: {:.0f}h {:.0f}m ##########".format(diff // 3600, (diff % 3600) // 60))

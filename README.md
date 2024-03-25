@@ -20,16 +20,20 @@ Install dependencies
 pip install -r requirements.txt
 ```
 
-Process tranining and test data sets
+Process training and test data sets
 ```
 python3 data_processing.py
 ```
 
-Monitor the compliance of ongoing traces
+Next-attributes-based PCM
+```
+python3 next_predictions.py
+```
+
+Continuation-based PCM
 ```
 python3 pcm.py
 ```
-
 
 ## License
 LGPL-3.0 license

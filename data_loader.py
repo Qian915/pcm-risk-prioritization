@@ -13,9 +13,9 @@ class LogsDataLoader:
         self._processed_path = f"data/{log_name}/processed"
         self._data_name = log_name
 
-    def prepare_data(self, df, activity_dict, max_case_length, time_scaler=None, y_scaler=None, shuffle = True):
+    def prepare_data(self, df, activity_dict, max_case_length, time_scaler=None, y_scaler=None, shuffle = False):
 
-        x_activity = df["prefix"].values
+        x_activity = df["prefix"].values    # 1d array
         x_time = df["latest_time"].values.astype(np.float32)
         y_activity = df["next_activity"].values
         y_time = df["next_time"].values.astype(np.float32)

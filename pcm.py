@@ -18,13 +18,13 @@ from sklearn.preprocessing import MinMaxScaler
 from ast import literal_eval
 
 parser = argparse.ArgumentParser(description="Predictive Compliance Monitoring with Risk Prioritization.")
-parser.add_argument("--dataset", default="BPIC_2011", type=str, help="dataset name")
+parser.add_argument("--dataset", default="bpic2011_c1", type=str, help="dataset name")
 parser.add_argument("--granularity", default="DAY", type=str, help="granularity of temporal features")
 parser.add_argument("--model_dir", default="./models", type=str, help="model directory")
 parser.add_argument("--result_dir", default="./results", type=str, help="results directory")
-parser.add_argument("--epochs", default=10, type=int, help="number of total epochs")    # epochs for O2C: 30!
-parser.add_argument("--batch_size", default=12, type=int, help="batch size")
-parser.add_argument("--learning_rate", default=0.01, type=float, help="learning rate")
+parser.add_argument("--epochs", default=100, type=int, help="number of total epochs")
+parser.add_argument("--batch_size", default=16, type=int, help="batch size")
+parser.add_argument("--learning_rate", default=0.0001, type=float, help="learning rate")
 parser.add_argument("--gpu", default=0, type=int, help="gpu id")
 
 args = parser.parse_args()
@@ -43,9 +43,11 @@ def train_model(train_df, activity_dict, max_case_length, vocab_size, model_path
     model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
         filepath=model_path, monitor='val_loss',
         save_weights_only=False, save_best_only=True)
+    # Define EarlyStopping callback with patience
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
     transformer_model.fit([train_act_x, train_time_x], [train_act_y, train_time_y], 
         epochs=args.epochs, batch_size=args.batch_size, validation_split=0.2, 
-        verbose=2, callbacks=[model_checkpoint_callback])
+        verbose=2, callbacks=[model_checkpoint_callback, early_stopping])
     return transformer_model, y_scaler
     
 def predict_suffix(test_df, k, prediction_model, activity_dict, max_case_length, y_scaler, granularity):
@@ -71,7 +73,7 @@ def predict_suffix(test_df, k, prediction_model, activity_dict, max_case_length,
                 suffix_k.at[idx, "case_id"] = case
                 suffix_k.at[idx, "k"] = k
                 suffix_k.at[idx, "prefix"] = _x_act[np.argmax(_x_act != 0):np.argmax(_x_act != 0)+k]
-                s = np.concatenate((_x_act, _next_act))
+                s = np.concatenate((_x_act, _next_act))     # s is 1-d array like [1 2 3 4]
                 suffix_k.at[idx, "suffix"] = s[np.argmax(s != 0):]    # suffix contains the prefix for the ease of compliance checking!
                 suffix_k.at[idx, "timestamps"] = _t
                 idx += 1
@@ -341,15 +343,18 @@ def update_time_granularity(granularity, time):
         return time.minute
 
 def update_duration_granularity(granularity, duration):
-    if granularity == "MONTH":
-        return duration.months
     if granularity == "DAY":
-        return duration.days
+        if duration.days:
+            diff = duration.days + duration.hours / 24 + duration.minutes / (24 * 60) + duration.seconds / (24 * 60 * 60)
+        else:
+            diff = duration.hours / 24 + duration.minutes / (24 * 60) + duration.seconds / (24 * 60 * 60)
     if granularity == "HOUR":
-        return duration.hours
-    if granularity == "MINUTE":
-        return duration.minutes    
-
+        if duration.days:
+            diff = duration.days * 24 + duration.hours + duration.minutes / 60 + duration.seconds / 3600
+        else:
+            diff = duration.hours + duration.minutes / 60 + duration.seconds / 3600
+    return diff
+    
 def calculate_degree_interval(value_actual, value_limit):
     value_limit = literal_eval(value_limit) if '(' in value_limit else int(value_limit)
     lower_value = value_limit[0]
@@ -442,7 +447,7 @@ if __name__ == "__main__":
     '''
     
     # Prediction suffixes for all prefixes and monitor compliance against all constraints
-    for k in range(1, max_case_length+1):
+    for k in range(1, max_case_length+1):	# max len = 40 according to benchmark paper! ->41 for bpic
         start = time.time()
         if len(test_df[test_df["k"]==k]) > 0:
             suffix_k = predict_suffix(test_df, k, transformer_model, activity_dict, max_case_length, y_scaler, args.granularity)
