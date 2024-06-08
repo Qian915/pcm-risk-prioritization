@@ -458,9 +458,23 @@ if __name__ == "__main__":
         writer.writerow(['result_pred', 'degree_vio_pred', 'degree_sat_pred', 'result_true', 'degree_vio_true', 'degree_sat_true', 'acc_fscore_mae'])
         writer.writerows(combined_data)
         
-    # evaluate performance of compliance checking results
-    # -> confusion matrix for compliance status
+    ### evaluate performance of compliance predictions ###
+        
+    # -> confusion matrix for compliance states
     labels=["sat", "vio_act", "vio_time"]
     cm = metrics.confusion_matrix(result_true, result_pred, labels=labels)
     make_confusion_matrix(cm, categories=labels, cbar=False)
     plt.savefig(result_path+'heatmap.pdf', format='pdf', bbox_inches='tight')
+
+    # -> scatter plot for compliance degrees
+    degree_vio_pred_loaded = [x for x in degree_vio_pred if pd.notna(x)]
+    degree_sat_pred_loaded = [x for x in degree_sat_pred if pd.notna(x)]
+    degree_pred = degree_vio_pred_loaded + degree_sat_pred_loaded
+    plt.figure(figsize=(4, 3))
+    plt.scatter(degree_pred, np.arange(len(degree_pred)))
+    plt.axvline(x=0.5, color='red', linestyle='--', label='Threshold')
+    plt.xlabel('Degree of Compliance')
+    plt.ylabel('Data Point Index')
+    plt.legend()
+    plt.savefig(result_path+'scatter_pred.pdf', format='pdf', bbox_inches='tight')
+    plt.show()
