@@ -25,12 +25,7 @@ Process training and test data sets
 python3 data_processing.py
 ```
 
-Next-attributes-based PCM
-```
-python3 next_predictions.py
-```
-
-Continuation-based PCM
+Predict compliance states and quantify the degree of compliance
 ```
 python3 pcm.py
 ```

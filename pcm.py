@@ -10,21 +10,28 @@ import tensorflow as tf
 import data_loader as loader
 import model
 import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import csv
+from itertools import zip_longest
 from datetime import timedelta
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from itertools import islice
 from sklearn.preprocessing import MinMaxScaler
 from ast import literal_eval
+from sklearn import metrics 
+from cf_matrix import make_confusion_matrix
+
 
 parser = argparse.ArgumentParser(description="Predictive Compliance Monitoring with Risk Prioritization.")
 parser.add_argument("--dataset", default="bpic2011_c1", type=str, help="dataset name")
 parser.add_argument("--granularity", default="DAY", type=str, help="granularity of temporal features")
 parser.add_argument("--model_dir", default="./models", type=str, help="model directory")
 parser.add_argument("--result_dir", default="./results", type=str, help="results directory")
-parser.add_argument("--epochs", default=100, type=int, help="number of total epochs")
-parser.add_argument("--batch_size", default=16, type=int, help="batch size")
-parser.add_argument("--learning_rate", default=0.0001, type=float, help="learning rate")
+parser.add_argument("--epochs", default=100, type=int, help="number of total epochs")    
+parser.add_argument("--batch_size", default=16, type=int, help="batch size")		
+parser.add_argument("--learning_rate", default=0.0001, type=float, help="learning rate")		# o2c: 0.00001
 parser.add_argument("--gpu", default=0, type=int, help="gpu id")
 
 args = parser.parse_args()
@@ -44,77 +51,11 @@ def train_model(train_df, activity_dict, max_case_length, vocab_size, model_path
         filepath=model_path, monitor='val_loss',
         save_weights_only=False, save_best_only=True)
     # Define EarlyStopping callback with patience
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)	
     transformer_model.fit([train_act_x, train_time_x], [train_act_y, train_time_y], 
         epochs=args.epochs, batch_size=args.batch_size, validation_split=0.2, 
         verbose=2, callbacks=[model_checkpoint_callback, early_stopping])
-    return transformer_model, y_scaler
-    
-def predict_suffix(test_df, k, prediction_model, activity_dict, max_case_length, y_scaler, granularity):
-    print(f"predicting suffixes of {k}-prefixes")
-    # Prepare test data of k-prefix
-    test_k = test_df[test_df["k"]==k]
-    ts = test_k["timestamps"].values   
-    _ts = list()
-    for t in ts:
-        _ts.append([_t for _t in t.split(", ")])
-    ts = np.array(_ts)  
-    cases = test_k["case_id"].values
-    x_act, x_time, y_act, y_time, _, _ = data_loader.prepare_data(test_k, activity_dict, max_case_length)
-    # Suffix prediction till [eoc]
-    suffix_k = pd.DataFrame(columns=["case_id", "k", "prefix", "suffix", "timestamps"])
-    idx = 0
-    while True:
-        next_act, next_time, ts = predict_next(prediction_model, x_act, x_time, y_scaler, ts, granularity)
-        # save completed cases
-        idx_del = list()
-        for i, (case, _x_act, _next_act, _t) in enumerate(zip(islice(cases, None), islice(x_act, None), islice(next_act, None),islice(ts, None))):
-            if _next_act[0] == check_coded_value(activity_dict, key="[eoc]"):        
-                suffix_k.at[idx, "case_id"] = case
-                suffix_k.at[idx, "k"] = k
-                suffix_k.at[idx, "prefix"] = _x_act[np.argmax(_x_act != 0):np.argmax(_x_act != 0)+k]
-                s = np.concatenate((_x_act, _next_act))     # s is 1-d array like [1 2 3 4]
-                suffix_k.at[idx, "suffix"] = s[np.argmax(s != 0):]    # suffix contains the prefix for the ease of compliance checking!
-                suffix_k.at[idx, "timestamps"] = _t
-                idx += 1
-                idx_del.append(i)
-        if len(idx_del) != 0:
-            cases = np.delete(cases, idx_del, axis=0)
-            x_act = np.delete(x_act, idx_del, axis=0)
-            x_time = np.delete(x_time, idx_del, axis=0)
-            next_act = np.delete(next_act, idx_del, axis=0)
-            next_time = np.delete(next_time, idx_del, axis=0)
-            ts = np.delete(ts, idx_del, axis=0)
-        if len(x_act) == 0:     # all cases ended already
-            break
-        if np.count_nonzero(x_act[0]) == max_case_length:     # maxlen is reached
-            for case, _x_act, _next_act, _t in zip(islice(cases, None), islice(x_act, None), islice(next_act, None),islice(ts, None)):
-                suffix_k.at[idx, "case_id"] = case
-                suffix_k.at[idx, "k"] = k
-                suffix_k.at[idx, "prefix"] = _x_act[np.argmax(_x_act != 0):np.argmax(_x_act != 0)+k]
-                s = np.concatenate((_x_act, _next_act))
-                suffix_k.at[idx, "suffix"] = s[np.argmax(s != 0):]
-                suffix_k.at[idx, "timestamps"] = _t
-                idx += 1
-            break
-        # Generate (k+1)-prefix
-        x_act = np.concatenate((x_act, next_act), axis=1)
-        x_act = tf.keras.preprocessing.sequence.pad_sequences(x_act, maxlen=max_case_length)
-        x_time = next_time
-    return suffix_k
-
-def predict_next(prediction_model, x_act, x_time, y_scaler, timestamps, granularity):
-    _next_act, next_time = prediction_model.predict([x_act, x_time], verbose=0)
-    next_act = np.argmax(_next_act, axis=1).reshape(-1,1)     # 1d -> 2d
-    _time_diff = y_scaler.inverse_transform(next_time)
-    time_diff = update_granularity(_time_diff, granularity)
-    ts_new = list()
-    for ts, diff in zip(timestamps, time_diff):
-        last_ts = datetime.strptime(ts[-1], "%Y-%m-%d %H:%M:%S")
-        append_ts = last_ts + diff
-        ts_new.append(np.concatenate((ts, [datetime.strftime(append_ts, "%Y-%m-%d %H:%M:%S")])))
-    ts_new = np.array(ts_new)   # 2d
-    return next_act, next_time, ts_new
+    return transformer_model, y_scaler, time_scaler
 
 def update_granularity(_time_diff, granularity):
     if granularity == "HOUR":
@@ -129,126 +70,90 @@ def check_coded_value(activity_dict, key=None, value=None):
             return v
         if value is not None and value == v:
             return k
-    return key 
+    return key
     
-def check_constraints(df, constraints, activity_dict, result):
-    pre, suc, relation_act = "predecessor", "successor", "relation_activity"
-    # replace activity names in constraints with coded numerical values
-    constraints[pre] = constraints[pre].apply(lambda act: check_coded_value(activity_dict, key=act))
-    constraints[suc] = constraints[suc].apply(lambda act: check_coded_value(activity_dict, key=act))
-
-    df_constraints = constraints[constraints[relation_act]=="df"]
-    ef_constraints = constraints[constraints[relation_act]=="ef"]
-    exist_constraints = constraints[constraints[relation_act]=="exist"]
-    coexist_constraints = constraints[constraints[relation_act]=="coexist"]
-    
-    if result == None:
-        result = {"df": {}, "ef": {}, "exist": {}, "coexist": {},}    
-    for _, case in df.iterrows():
-        result["df"] = check_df_relation(df_constraints, case, result["df"])
-        result["ef"] = check_ef_relation(ef_constraints, case, result["ef"])
-        result["coexist"] = check_coexist_relation(coexist_constraints, case, result["coexist"])
-        result["exist"] = check_exist_relation(exist_constraints, case, result["exist"])
-    return result
-    
-def check_df_relation(df_constraints, trace, df_compliance):
-    suffix, ts = trace["suffix"], trace["timestamps"]   # trace["timestamps"] is an nparray of type string
-    sample_df = pd.DataFrame(columns=["case_id", "k", "prefix", "suffix", "timestamps", "degree"])
-    # check every df constraint
-    for _, constraint in df_constraints.iterrows():
-        if len(df_compliance.get(constraint["constraint_id"], {})) == 0:
-            df_compliance[constraint["constraint_id"]] = {"violations": {"activity": [], "time": sample_df.copy()}, "satisfactions": sample_df.copy()}
-        df_compliance_k = df_compliance[constraint["constraint_id"]]
-        pre = constraint["predecessor"]
-        suc = constraint["successor"]
+def check_df_relation(df_constraint, traces):
+    result, degree_sat, degree_vio = [],[],[]
+    pre = df_constraint.iloc[0]["predecessor"]
+    suc = df_constraint.iloc[0]["successor"]
+    for _, trace in traces.iterrows():
+        suffix, ts = trace["suffix"], trace["timestamps"]   # trace["timestamps"] is an nparray of type string
         if pre in suffix and suc in suffix:
             idx_pre = np.where(suffix==pre)[0][0]
             idx_suc = np.where(suffix==suc)[0][0]
             # check time perspective
             if idx_suc == idx_pre + 1:               
-                if constraint["time_type"] == "DURATION":
+                if df_constraint.iloc[0]["time_type"] == "DURATION":
                     time_actual = relativedelta(datetime.strptime(ts[idx_suc], "%Y-%m-%d %H:%M:%S"), datetime.strptime(ts[idx_pre], "%Y-%m-%d %H:%M:%S"))
-                    time_actual = update_duration_granularity(constraint["granularity"], time_actual)
+                    time_actual = update_duration_granularity(df_constraint.iloc[0]["granularity"], time_actual)
                 else:
                     time_actual = datetime.strptime(ts[idx_suc], "%Y-%m-%d %H:%M:%S")
-                    time_actual = update_time_granularity(constraint["granularity"], time_actual)
-                time_limit = constraint["time_value"]
-                time_to_be_scaled = check_time(constraint, time_actual, time_limit)
-                trace["degree"] = time_to_be_scaled
+                    time_actual = update_time_granularity(df_constraint.iloc[0]["granularity"], time_actual)
+                time_limit = df_constraint.iloc[0]["time_value"]
+                time_to_be_scaled = check_time(df_constraint, time_actual, time_limit)
                 # constraint satisfied
                 if time_to_be_scaled >= 0:
-                    print(f"-> trace {trace['case_id']}_{trace['k']} satisfies constraint {constraint['constraint_id']}!")
-                    df_compliance_k["satisfactions"] = pd.concat([df_compliance_k["satisfactions"], trace.to_frame().T], ignore_index=True)
+                    result.append("sat")
+                    degree_sat.append(time_to_be_scaled)
                 # constraint violated: root cause - time
                 else:
-                    print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on time!")
-                    df_compliance_k["violations"]["time"] = pd.concat([df_compliance_k["violations"]["time"], trace.to_frame().T], ignore_index=True)
-            # constraint violated: root cause - successor does not occurs immediately after the predecessor - only record the case id and length of the prefix/case
+                    result.append("vio_time")
+                    degree_vio.append(time_to_be_scaled)
+            # constraint violated: root cause - successor does not occurs immediately after the predecessor
             else:
-                print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on activity: other events between pre and suc!")
-                df_compliance_k["violations"]["activity"].append([trace["case_id"], trace["k"]])       # list([case_0, k_1], [case_1,k_1],...)
+                result.append("vio_act")
         elif pre not in suffix and suc not in suffix:
-            continue
+            # wrong prediction for the next activity 
+            result.append("vio_act")
         # constraint violated: root cause - predecessor and successor don't occur simultaneously
         else:
-            print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on activity: only one occurs!")
-            df_compliance_k["violations"]["activity"].append([trace["case_id"], trace["k"]]) 
-    return df_compliance
+            result.append("vio_act") 
+    return result, degree_vio, degree_sat   
 
-def check_ef_relation(ef_constraints, trace, ef_compliance):
-    suffix, ts = trace["suffix"], trace["timestamps"]
-    sample_df = pd.DataFrame(columns=["case_id", "k", "prefix", "suffix", "timestamps", "degree"])
-    # check every ef constraint
-    for _, constraint in ef_constraints.iterrows():
-        if len(ef_compliance.get(constraint["constraint_id"], {})) == 0:
-            ef_compliance[constraint["constraint_id"]] = {"violations": {"activity": [], "time": sample_df.copy()}, "satisfactions": sample_df.copy()}
-        ef_compliance_k = ef_compliance[constraint["constraint_id"]]
-        pre = constraint["predecessor"]
-        suc = constraint["successor"]
+def check_ef_relation(ef_constraint, traces):
+    result, degree_sat, degree_vio = [],[],[]
+    pre = ef_constraint.iloc[0]["predecessor"]
+    suc = ef_constraint.iloc[0]["successor"]
+    for _, trace in traces.iterrows():
+        suffix, ts = trace["suffix"], trace["timestamps"]
         if pre in suffix and suc in suffix:
             idx_pre = np.where(suffix==pre)[0][0]   # return the first occurrence! -> delete duplicates in the log?
             idx_suc = np.where(suffix==suc)[0][0]
             # check time perspective
             if idx_suc > idx_pre:
-                if constraint["time_type"] == "DURATION":
+                if ef_constraint.iloc[0]["time_type"] == "DURATION":
                     time_actual = relativedelta(datetime.strptime(ts[idx_suc], "%Y-%m-%d %H:%M:%S"), datetime.strptime(ts[idx_pre], "%Y-%m-%d %H:%M:%S"))
-                    time_actual = update_duration_granularity(constraint["granularity"], time_actual)
+                    time_actual = update_duration_granularity(ef_constraint.iloc[0]["granularity"], time_actual)
                 else:
                     time_actual = datetime.strptime(ts[idx_suc], "%Y-%m-%d %H:%M:%S")
-                    time_actual = update_time_granularity(constraint["granularity"], time_actual)
-                time_limit = constraint["time_value"]
-                time_to_be_scaled = check_time(constraint, time_actual, time_limit)
-                trace["degree"] = time_to_be_scaled
+                    time_actual = update_time_granularity(ef_constraint.iloc[0]["granularity"], time_actual)
+                time_limit = ef_constraint.iloc[0]["time_value"]
+                time_to_be_scaled = check_time(ef_constraint, time_actual, time_limit)
                 # constraint satisfied
                 if time_to_be_scaled >= 0:
-                    print(f"-> trace {trace['case_id']}_{trace['k']} satisfies constraint {constraint['constraint_id']}!")
-                    ef_compliance_k["satisfactions"] = pd.concat([ef_compliance_k["satisfactions"], trace.to_frame().T], ignore_index=True)
+                    result.append("sat")
+                    degree_sat.append(time_to_be_scaled)
                 # constraint violated: root cause - time
                 else:
-                    print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on time!")
-                    ef_compliance_k["violations"]["time"] = pd.concat([ef_compliance_k["violations"]["time"], trace.to_frame().T], ignore_index=True)
-            # constraint violated: root cause - successor occurs before the predecessor - only record the case id and length of the prefix/case
+                    result.append("vio_time")
+                    degree_vio.append(time_to_be_scaled)
+            # constraint violated: root cause - successor occurs before the predecessor
             else:
-                print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on activity: suc before pre!")
-                ef_compliance_k["violations"]["activity"].append([trace["case_id"], trace["k"]])       # list([case_0, k_1], [case_1,k_1],...)
+                result.append("vio_act")
         elif pre not in suffix and suc not in suffix:
-            continue
+            # wrong prediction for the next activity 
+            result.append("vio_act")
         # constraint violated: root cause - predecessor and successor don't occur simultaneously
         else:
-            print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on activity: only one occurs!")
-            ef_compliance_k["violations"]["activity"].append([trace["case_id"], trace["k"]]) 
-    return ef_compliance
+            result.append("vio_act") 
+    return result, degree_vio, degree_sat
 
-def check_coexist_relation(coexist_constraints, trace, coexist_compliance):
-    suffix, ts = trace["suffix"], trace["timestamps"]
-    sample_df = pd.DataFrame(columns=["case_id", "k", "prefix", "suffix", "timestamps", "degree"])
-    # check every coexist constraint
-    for _, constraint in coexist_constraints.iterrows():
-        if len(coexist_compliance.get(constraint["constraint_id"], {})) == 0:
-            coexist_compliance[constraint["constraint_id"]] = {"violations": {"activity": [], "time": sample_df.copy()}, "satisfactions": sample_df.copy()}
-        coexist_compliance_k = coexist_compliance[constraint["constraint_id"]]
-        pre = constraint["predecessor"]
-        suc = constraint["successor"]
+def check_coexist_relation(coexist_constraint, traces):
+    result, degree_sat, degree_vio = [],[],[]
+    pre = coexist_constraint.iloc[0]["predecessor"]
+    suc = coexist_constraint.iloc[0]["successor"]
+    for _, trace in traces.iterrows():
+        suffix, ts = trace["suffix"], trace["timestamps"]
         # check time perspective
         if pre in suffix and suc in suffix:
             idx_pre = np.where(suffix==pre)[0][0]
@@ -257,77 +162,69 @@ def check_coexist_relation(coexist_constraints, trace, coexist_compliance):
                 tmp = idx_pre
                 idx_pre = idx_suc
                 idx_suc = tmp           
-            if constraint["time_type"] == "DURATION":
+            if coexist_constraint.iloc[0]["time_type"] == "DURATION":
                     time_actual = relativedelta(datetime.strptime(ts[idx_suc], "%Y-%m-%d %H:%M:%S"), datetime.strptime(ts[idx_pre], "%Y-%m-%d %H:%M:%S"))
-                    time_actual = update_duration_granularity(constraint["granularity"], time_actual)
+                    time_actual = update_duration_granularity(coexist_constraint.iloc[0]["granularity"], time_actual)
             else:
                 time_actual = datetime.strptime(ts[idx_suc], "%Y-%m-%d %H:%M:%S")
-                time_actual = update_time_granularity(constraint["granularity"], time_actual)
-            time_limit = constraint["time_value"]
-            time_to_be_scaled = check_time(constraint, time_actual, time_limit)
-            trace["degree"] = time_to_be_scaled
+                time_actual = update_time_granularity(coexist_constraint.iloc[0]["granularity"], time_actual)
+            time_limit = coexist_constraint.iloc[0]["time_value"]
+            time_to_be_scaled = check_time(coexist_constraint, time_actual, time_limit)
             # constraint satisfied
             if time_to_be_scaled >= 0:
-                print(f"-> trace {trace['case_id']}_{trace['k']} satisfies constraint {constraint['constraint_id']}!")
-                coexist_compliance_k["satisfactions"] = pd.concat([coexist_compliance_k["satisfactions"], trace.to_frame().T], ignore_index=True)
+                result.append("sat")
+                degree_sat.append(time_to_be_scaled)
             # constraint violated: root cause - time
             else:
-                print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on time!")
-                coexist_compliance_k["violations"]["time"] = pd.concat([coexist_compliance_k["violations"]["time"], trace.to_frame().T], ignore_index=True)
+                result.append("vio_time")
+                degree_vio.append(time_to_be_scaled)
         elif pre not in suffix and suc not in suffix:
             continue
         # constraint violated: root cause - predecessor and successor don't occur simultaneously
         else:
-            print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on activity: only one occurs!")
-            coexist_compliance_k["violations"]["activity"].append([trace["case_id"], trace["k"]]) 
-    return coexist_compliance
+            result.append("vio_act") 
+    return result, degree_vio, degree_sat
 
-def check_exist_relation(exist_constraints, trace, exist_compliance):
-    suffix, ts = trace["suffix"], trace["timestamps"]
-    sample_df = pd.DataFrame(columns=["case_id", "k", "prefix", "suffix", "timestamps", "degree"])
-    # check every exist constraint
-    for _, constraint in exist_constraints.iterrows():
-        if len(exist_compliance.get(constraint["constraint_id"], {})) == 0:
-            exist_compliance[constraint["constraint_id"]] = {"violations": {"activity": [], "time": sample_df.copy()}, "satisfactions": sample_df.copy()}
-        exist_compliance_k = exist_compliance[constraint["constraint_id"]]
-        act = constraint["predecessor"]
+def check_exist_relation(exist_constraint, traces):
+    result, degree_sat, degree_vio = [],[],[]
+    act = exist_constraint.iloc[0]["predecessor"]
+    for _, trace in traces.iterrows():
+        suffix, ts = trace["suffix"], trace["timestamps"]
         # check time perspective
         _time_last = datetime.strptime(ts[-1], "%Y-%m-%d %H:%M:%S")
-        time_last = update_time_granularity(constraint["granularity"], _time_last)
-        time_limit = constraint["time_value"]
-        time_last_to_be_scaled = check_time(constraint, time_last, time_limit)
+        time_last = update_time_granularity(exist_constraint.iloc[0]["granularity"], _time_last)
+        time_limit = exist_constraint.iloc[0]["time_value"]
+        time_last_to_be_scaled = check_time(exist_constraint, time_last, time_limit)
         if act in suffix:
             idx = np.where(suffix==act)[0][0]
             _time_actual = datetime.strptime(ts[idx], "%Y-%m-%d %H:%M:%S")
-            time_actual = update_time_granularity(constraint["granularity"], _time_actual)
-            time_to_be_scaled = check_time(constraint, time_actual, time_limit)
-            trace["degree"] = time_to_be_scaled
+            time_actual = update_time_granularity(exist_constraint.iloc[0]["granularity"], _time_actual)
+            time_to_be_scaled = check_time(exist_constraint, time_actual, time_limit)
             # constraint satisfied
             if time_to_be_scaled >= 0:
-                print(f"-> trace {trace['case_id']}_{trace['k']} satisfies constraint {constraint['constraint_id']}!")
-                exist_compliance_k["satisfactions"] = pd.concat([exist_compliance_k["satisfactions"], trace.to_frame().T], ignore_index=True)
+                result.append("sat")
+                degree_sat.append(time_to_be_scaled)
             # constraint violated: root cause - time
             else:
-                print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on time!")
-                exist_compliance_k["violations"]["time"] = pd.concat([exist_compliance_k["violations"]["time"], trace.to_frame().T], ignore_index=True)
+                result.append("vio_time")
+                degree_vio.append(time_to_be_scaled)
         # the condition of presence is not fulfilled
         elif act not in suffix and time_last_to_be_scaled < 0:
             continue
         # constraint violated: root cause - activity does not occur
         else:
-            print(f"-> trace {trace['case_id']}_{trace['k']} violates constraint {constraint['constraint_id']} on activity: pre does not occur!")
-            exist_compliance_k["violations"]["activity"].append([trace["case_id"], trace["k"]]) 
-    return exist_compliance
+            result.append("vio_act") 
+    return result, degree_vio, degree_sat
 
 def check_time(constraint,time_actual, time_limit):
-    if constraint["relation_time"] == "interval":
-        time_to_be_scaled = calculate_degree_interval(time_actual, time_limit)
-    elif constraint["relation_time"] == "max":
-        time_to_be_scaled = calculate_degree_max(time_actual, time_limit)
-    elif constraint["relation_time"] == "min":
-        time_to_be_scaled = calculate_degree_min(time_actual, time_limit)
+    if constraint.iloc[0]["relation_time"] == "interval":
+        time_to_be_scaled = calculate_value_interval(time_actual, time_limit)
+    elif constraint.iloc[0]["relation_time"] == "max":
+        time_to_be_scaled = calculate_value_max(time_actual, time_limit)
+    elif constraint.iloc[0]["relation_time"] == "min":
+        time_to_be_scaled = calculate_value_min(time_actual, time_limit)
     else:
-        time_to_be_scaled = calculate_degree_exactlyAt(time_actual, time_limit)
+        time_to_be_scaled = calculate_value_exactlyAt(time_actual, time_limit)
     return time_to_be_scaled
 
 def update_time_granularity(granularity, time):
@@ -353,9 +250,9 @@ def update_duration_granularity(granularity, duration):
             diff = duration.days * 24 + duration.hours + duration.minutes / 60 + duration.seconds / 3600
         else:
             diff = duration.hours + duration.minutes / 60 + duration.seconds / 3600
-    return diff
-    
-def calculate_degree_interval(value_actual, value_limit):
+    return diff    
+
+def calculate_value_interval(value_actual, value_limit):
     value_limit = literal_eval(value_limit) if '(' in value_limit else int(value_limit)
     lower_value = value_limit[0]
     upper_value = value_limit[1]
@@ -371,7 +268,7 @@ def calculate_degree_interval(value_actual, value_limit):
     else:
         return -((distance_to_center - width) ** 2)
     
-def calculate_degree_max(value_actual, value_max):
+def calculate_value_max(value_actual, value_max):
     value_max = int(value_max)
     distance_to_max = value_actual - value_max
 
@@ -380,7 +277,7 @@ def calculate_degree_max(value_actual, value_max):
     else:
         return -distance_to_max**2
     
-def calculate_degree_min(value_actual, value_min):
+def calculate_value_min(value_actual, value_min):
     value_min = int(value_min)
     distance_to_min = value_actual - value_min
 
@@ -389,7 +286,7 @@ def calculate_degree_min(value_actual, value_min):
     else:
         return -distance_to_min**2
 
-def calculate_degree_exactlyAt(value_actual, value_center):
+def calculate_value_exactlyAt(value_actual, value_center):
     value_center = int(value_center)
     distance_to_center = np.abs(value_actual - value_center)
     epsilon = 1e-10
@@ -402,16 +299,18 @@ def calculate_degree_exactlyAt(value_actual, value_center):
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
-def calculate_probability(df_original):
+def calculate_degree(degrees_original):
+    degree_vio = degrees_original[0]
+    degree_sat = degrees_original[1]
     scalers = [MinMaxScaler(feature_range=(-5, -1e-5)), MinMaxScaler(feature_range=(0, 5))]
-    # Transform values ("degree" column) to probabilities using sigmoid function
-    for i, df in enumerate(df_original):
-        if len(df) > 0:
-            # Fit and transform using the scaler
-            df['scaled_degree'] = scalers[i].fit_transform(df[['degree']])               
-            # Apply sigmoid function to scaled values
-            df['probability'] = sigmoid(df['scaled_degree'])
-    return df_original[0], df_original[1]
+    # Transform values to compliance degrees via sigmoid function
+    if len(degree_vio) > 0:
+        degree_vio = sigmoid(scalers[0].fit_transform(np.array(degree_vio).reshape(-1, 1)))
+        degree_vio = degree_vio.flatten().tolist()
+    if len(degree_sat) > 0:
+        degree_sat = sigmoid(scalers[1].fit_transform(np.array(degree_sat).reshape(-1, 1)))
+        degree_sat = degree_sat.flatten().tolist()
+    return degree_vio, degree_sat
 
 if __name__ == "__main__":
     model_path = f"{args.model_dir}/{args.dataset}"
@@ -427,83 +326,141 @@ if __name__ == "__main__":
 
     # Load data
     data_loader = loader.LogsDataLoader(args.dataset)
-    (train_df, test_df, activity_dict, max_case_length, vocab_size) = data_loader.load_data()
-    '''
-    (train_act_x, train_time_x, 
-        train_act_y, train_time_y, time_scaler, y_scaler) = data_loader.prepare_data(train_df, activity_dict, max_case_length)
-    '''
-    
-    # Load constraints
-    constraints = pd.read_excel(f"constraints/{args.dataset}.xlsx")   # excel file
+    (train_df, _test_df, activity_dict, max_case_length, vocab_size) = data_loader.load_data()
 
+    # Load constraints
+    constraint = pd.read_excel(f"constraints/{args.dataset}.xlsx")   # constraint is a df with one row!
+    pre, suc, relation_act = "predecessor", "successor", "relation_activity"
+
+    # Filter cases in test_df for evaluation and compliance checking
+    pref, next_act = "prefix", "next_activity"
+    test_df = pd.DataFrame(columns=_test_df.columns)
+    unique_cases = _test_df["case_id"].unique()
+    # for df/ef constraint
+    if constraint.at[0, relation_act] == "df" or constraint.at[0, relation_act] == "ef":
+        for _, case in enumerate(unique_cases):   
+            trace = _test_df[_test_df["case_id"] == case].copy()
+            # only select the first occurrence to avoid duplicates
+            filtered_case = trace[trace[next_act] == constraint.at[0, suc]].head(1)
+            test_df = pd.concat([test_df, filtered_case], ignore_index=True)
+    # for coexist constraint
+    if constraint.at[0, relation_act] == "coexist":
+        for _, case in enumerate(unique_cases):   
+            trace = _test_df[_test_df["case_id"] == case].copy()
+            # pre -> suc
+            filtered_case = trace[trace[next_act] == constraint.at[0, suc]].head(1)
+            if not filtered_case.empty and constraint.at[0, pre] in filtered_case.iloc[0][pref]:
+                test_df = pd.concat([test_df, filtered_case], ignore_index=True)
+            # suc -> pre
+            filtered_case = trace[trace[next_act] == constraint.at[0, pre]].head(1)
+            if not filtered_case.empty and constraint.at[0, suc] in filtered_case.iloc[0][pref]:
+                test_df = pd.concat([test_df, filtered_case], ignore_index=True)    
+    test_df.to_csv(f"data/{args.dataset}/test_updated.csv", index=False)
+    
     # Train the prediction model based on the training set
-    transformer_model, y_scaler = train_model(train_df, activity_dict, max_case_length, vocab_size, model_path)
-    # Load model after training
-    '''
-    with tf.keras.utils.custom_object_scope({
-        'TokenAndPositionEmbedding': model.TokenAndPositionEmbedding,
-        'TransformerBlock': model.TransformerBlock}):
-            transformer_model = tf.keras.models.load_model(model_path)
-    '''
+    transformer_model, y_scaler, time_scaler = train_model(train_df, activity_dict, max_case_length, vocab_size, model_path)
+
+    # Evaluate over filtered test_df
+    x_act, x_time, _y_act_true, _y_time_true, _, _ = data_loader.prepare_data(test_df, activity_dict, max_case_length, time_scaler, y_scaler)
+    _y_act_pred, _y_time_pred = transformer_model.predict([x_act, x_time], verbose=0)
+        # metrics for activity prediction
+    y_act_true = _y_act_true.flatten()      # y_act_true: 1d
+    y_act_pred = np.argmax(_y_act_pred, axis=1)     # y_act_pred: 1d 
+    accuracy = metrics.accuracy_score(y_act_true, y_act_pred)
+    precision, recall, fscore, _ = metrics.precision_recall_fscore_support(y_act_true, y_act_pred, average="weighted")
+    print('Accuracy:', accuracy)
+    print('F-score:', fscore)
+    print('Precision:', precision)
+    print('Recall:', recall)
+        # metrics for time prediction
+    y_time_true = y_scaler.inverse_transform(_y_time_true).flatten()    # y_time_true: 1d
+    y_time_pred = y_scaler.inverse_transform(_y_time_pred)      # y_time_pred: 1d
+    mae = metrics.mean_absolute_error(y_time_true, y_time_pred)
+    mse = metrics.mean_squared_error(y_time_true, y_time_pred)
+    rmse = np.sqrt(metrics.mean_squared_error(y_time_true, y_time_pred))
+    print('MAE:', mae)
+    print('MSE:', mse)
+    print('RMSE:', rmse)
+    acc_fscore_mae = []
+    acc_fscore_mae.extend([accuracy, fscore, mae])
+
+    # check compliance for the corresponding constraint:
+    # prepare data sets for compliance checking: add the next activity to prefix column; add the next time to timestamps column
+    suffix = test_df[["case_id","timestamps"]]
+    #suffix.columns = ["case_id", "suffix", "timestamps"]
+    # convert timestamps to array
+    _ts = suffix["timestamps"].values   
+    ts = list()
+    for t in _ts:
+        ts.append([_t for _t in t.split(", ")])
+    #ts = np.array(_ts)  # not a 2d array -> a 2d list!!!
+    suffix_true = suffix.copy()
+    suffix_pred = suffix.copy()
+
+    s_true = np.concatenate((x_act, y_act_true.reshape(-1,1)), axis=1)
+    s_true_list = [[elem for elem in inner_list if elem != 0] for inner_list in s_true.tolist()]
+    suffix_true["suffix"] = s_true_list      # delete zeros
+    s_pred = np.concatenate((x_act, y_act_pred.reshape(-1,1)), axis=1)
+    s_pred_list = [[elem for elem in inner_list if elem != 0] for inner_list in s_pred.tolist()]
+    suffix_pred["suffix"] = s_pred_list
+
+    time_diff_true = update_granularity(y_time_true.reshape(-1,1), args.granularity)
+    ts_true = list()
+    for t, diff in zip(ts, time_diff_true):  # suffix["timestamps"] is a string of timestamps seperated by ','
+        #ts = [timestamp.strip() for timestamp in ts_string.split(',')]     # convert the string of timestamps to a list ['...', '...']
+        last_ts = datetime.strptime(t[-1], "%Y-%m-%d %H:%M:%S")
+        append_ts = last_ts + diff
+        ts_true.append(np.concatenate((t, [datetime.strftime(append_ts, "%Y-%m-%d %H:%M:%S")])))
+    #ts_true = np.array(ts_true)   # not a 2d array -> a 2d list!!!
+    suffix_true["timestamps"] = ts_true
+
+    time_diff_pred = update_granularity(y_time_pred.reshape(-1,1), args.granularity)	#reshape to 2d!
+    ts_pred = list()
+    for t, diff in zip(ts, time_diff_pred):
+        last_ts = datetime.strptime(t[-1], "%Y-%m-%d %H:%M:%S")
+        append_ts = last_ts + diff
+        ts_pred.append(np.concatenate((t, [datetime.strftime(append_ts, "%Y-%m-%d %H:%M:%S")])))
+    #ts_pred = np.array(ts_pred)   # 2d
+    suffix_pred["timestamps"] = ts_pred
+    # save df for true and predicted values
+    suffix_true.to_csv(f"data/suffix_true.csv", index=False)
+    suffix_pred.to_csv(f"data/suffix_pred.csv", index=False)
+
+    # start compliance checking
+    constraint[pre] = constraint[pre].apply(lambda act: check_coded_value(activity_dict, key=act))
+    constraint[suc] = constraint[suc].apply(lambda act: check_coded_value(activity_dict, key=act))
+    # for df constraint
+    if constraint.at[0, relation_act] == "df":
+        result_pred, degree_vio_pred, degree_sat_pred = check_df_relation(constraint, suffix_pred)
+        result_true, degree_vio_true, degree_sat_true = check_df_relation(constraint, suffix_true)
+    # for ef constraint
+    if constraint.at[0, relation_act] == "ef":
+        print("######for prediction######")
+        result_pred, degree_vio_pred, degree_sat_pred = check_ef_relation(constraint, suffix_pred)
+        print("######for ground truth######")
+        result_true, degree_vio_true, degree_sat_true = check_ef_relation(constraint, suffix_true)
+    # for coexist constraint
+    if constraint.at[0, relation_act] == "coexist":
+        result_pred, degree_vio_pred, degree_sat_pred = check_coexist_relation(constraint, suffix_pred)
+        result_true, degree_vio_true, degree_sat_true = check_coexist_relation(constraint, suffix_true)
+    # for exist constraint
+    if constraint.at[0, relation_act] == "exist":
+        result_pred, degree_vio_pred, degree_sat_pred = check_exist_relation(constraint, suffix_pred)
+        result_true, degree_vio_true, degree_sat_true = check_exist_relation(constraint, suffix_true)
+    # convert values to degrees of compliance via sigmoid function
+    degree_vio_pred, degree_sat_pred = calculate_degree([degree_vio_pred, degree_sat_pred])
+    degree_vio_true, degree_sat_true = calculate_degree([degree_vio_true, degree_sat_true])
     
-    # Prediction suffixes for all prefixes and monitor compliance against all constraints
-    for k in range(1, max_case_length+1):	# max len = 40 according to benchmark paper! ->41 for bpic
-        start = time.time()
-        if len(test_df[test_df["k"]==k]) > 0:
-            suffix_k = predict_suffix(test_df, k, transformer_model, activity_dict, max_case_length, y_scaler, args.granularity)
-            result = check_constraints(suffix_k, constraints, activity_dict, result)
-        end = time.time()
-        diff = end - start
-        print("########## Time spent for {}-prefixes: {:.0f}h {:.0f}m ##########".format(k, diff // 3600, (diff % 3600) // 60))
-    
-    # Calculate the degree of compliance per constraint
-    # df
-    if len(result["df"]) > 0:
-        for constraint, df_compliance in result["df"].items():
-            num_sat = len(df_compliance["satisfactions"])
-            num_vio = len(df_compliance["violations"]["activity"]) + len(df_compliance["violations"]["time"])
-            healthiness = num_sat / (num_sat + num_vio)
-            print(f"compliance degree with respect to {constraint} is {healthiness}")
-            print(f"number of satisfactions: {num_sat}; number of time_violations: {len(df_compliance['violations']['time'])}; number of act_violations: {len(df_compliance['violations']['activity'])}")
-            # Transform numerical values of "degree" to probabilities via sigmoid function
-            df_compliance["violations"]["time"], df_compliance["satisfactions"] = \
-                calculate_probability([df_compliance["violations"]["time"], df_compliance["satisfactions"]])
-            # Save results
-            df_compliance["satisfactions"].to_csv(result_path + constraint + "_satisfaction.csv", index=False)
-            df_compliance["violations"]["time"].to_csv(result_path + constraint + "_violation.csv", index=False)
-    # ef
-    if len(result["ef"]) > 0:
-        for constraint, ef_compliance in result["ef"].items():
-            num_sat = len(ef_compliance["satisfactions"])
-            num_vio = len(ef_compliance["violations"]["activity"]) + len(ef_compliance["violations"]["time"])
-            healthiness = num_sat / (num_sat + num_vio)
-            print(f"compliance degree with respect to {constraint} is {healthiness}")
-            print(f"number of satisfactions: {num_sat}; number of time_violations: {len(ef_compliance['violations']['time'])}; number of act_violations: {len(ef_compliance['violations']['activity'])}")
-            ef_compliance["violations"]["time"], ef_compliance["satisfactions"] = \
-                calculate_probability([ef_compliance["violations"]["time"], ef_compliance["satisfactions"]])
-            ef_compliance["satisfactions"].to_csv(result_path + constraint + "_satisfaction.csv", index=False)
-            ef_compliance["violations"]["time"].to_csv(result_path + constraint + "_violation.csv", index=False)
-    # exist
-    if len(result["exist"]) > 0:
-        for constraint, exist_compliance in result["exist"].items():
-            num_sat = len(exist_compliance["satisfactions"])
-            num_vio = len(exist_compliance["violations"]["activity"]) + len(exist_compliance["violations"]["time"])
-            healthiness = num_sat / (num_sat + num_vio)
-            print(f"compliance degree with respect to {constraint} is {healthiness}")
-            print(f"number of satisfactions: {num_sat}; number of time_violations: {len(exist_compliance['violations']['time'])}; number of act_violations: {len(exist_compliance['violations']['activity'])}")
-            exist_compliance["violations"]["time"], exist_compliance["satisfactions"] = \
-                calculate_probability([exist_compliance["violations"]["time"], exist_compliance["satisfactions"]])
-            exist_compliance["satisfactions"].to_csv(result_path + constraint + "_satisfaction.csv", index=False)
-            exist_compliance["violations"]["time"].to_csv(result_path + constraint + "_violation.csv", index=False)
-    # coexist
-    if len(result["coexist"]) > 0:
-        for constraint, coexist_compliance in result["coexist"].items():
-            num_sat = len(coexist_compliance["satisfactions"])
-            num_vio = len(coexist_compliance["violations"]["activity"]) + len(coexist_compliance["violations"]["time"])
-            healthiness = num_sat / (num_sat + num_vio)
-            print(f"compliance degree with respect to {constraint} is {healthiness}")
-            print(f"number of satisfactions: {num_sat}; number of time_violations: {len(coexist_compliance['violations']['time'])}; number of act_violations: {len(coexist_compliance['violations']['activity'])}")
-            coexist_compliance["violations"]["time"], coexist_compliance["satisfactions"] = \
-                calculate_probability([coexist_compliance["violations"]["time"], coexist_compliance["satisfactions"]])
-            coexist_compliance["satisfactions"].to_csv(result_path + constraint + "_satisfaction.csv", index=False)
-            coexist_compliance["violations"]["time"].to_csv(result_path + constraint + "_violation.csv", index=False)
+    # save all results
+    combined_data = zip_longest(result_pred, degree_vio_pred, degree_sat_pred, result_true, degree_vio_true, degree_sat_true, acc_fscore_mae, fillvalue=None)
+    with open(result_path+'output.csv', 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['result_pred', 'degree_vio_pred', 'degree_sat_pred', 'result_true', 'degree_vio_true', 'degree_sat_true', 'acc_fscore_mae'])
+        writer.writerows(combined_data)
+        
+    # evaluate performance of compliance checking results
+    # -> confusion matrix for compliance status
+    labels=["sat", "vio_act", "vio_time"]
+    cm = metrics.confusion_matrix(result_true, result_pred, labels=labels)
+    make_confusion_matrix(cm, categories=labels, cbar=False)
+    plt.savefig(result_path+'heatmap.pdf', format='pdf', bbox_inches='tight')
